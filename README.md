@@ -1,48 +1,72 @@
 # Tiny Text Service (custom TCP)
 
-A minimal, non-HTTP way to serve and fetch text (or any bytes) over raw TCP.
+A minimal, non-HTTP way to serve and fetch text **and images (any bytes)** over raw TCP.
 Built for learning + simple LAN/Internet transfers without web stacks.
-
 
 <img width="812" height="640" alt="Screenshot 2025-10-20 at 00 02 18" src="https://github.com/user-attachments/assets/0c4fdbc7-24ff-4799-928e-057356bd2755" />
 <img width="812" height="640" alt="Screenshot 2025-10-20 at 00 02 22" src="https://github.com/user-attachments/assets/ae9b3c55-a67c-4a18-8562-5c7942c8ef5f" />
+<img width="992" height="700" alt="Screenshot 2025-10-20 at 00 19 33" src="https://github.com/user-attachments/assets/c810ca27-9395-41da-a10e-7ee050d939c6" />
+
+---
 
 ## What’s here
 
 * **`txtserve.c`** – single-file server: serves one file.
 * **`txtclient.c`** – single-file client.
-* **`txtserve_multi.c`** – multi-file server: serves files inside a directory.
+* **`txtserve_multi.c`** – multi-file server: serves files inside a directory; supports `LIST`, `HEAD <name>`, `GET <name>`.
 * **`txtclient_multi.c`** – multi-file client: request a specific file by name.
-* **`gui_client.py`** – simple macOS GUI to list and open files from the multi-file server.
-* **`myweb/`** – example content directory (e.g., `content.txt`, `other.txt`).
+* **`gui_client.py`** – macOS/desktop GUI:
+
+  * Lists server files (`LIST`)
+  * Click to preview text or images (PNG/JPEG/GIF/BMP/WebP)
+  * **Save…** to disk
+  * **Head** (show size/type)
+  * **Open in Preview** (macOS)
+* **`myweb/`** – example content directory (e.g., `content.txt`, `other.txt`, `logo.png`).
 * **`myip.c`** – helper to print local IPs (not required).
+
+---
 
 ## Purpose
 
-* Demonstrate a **tiny, bespoke TCP protocol** (no HTTP) for serving files.
-* Keep the code small, auditable, and portable (C11).
-* Show how to use it **on a LAN** or **over the internet** (with proper firewall/NAT setup).
-* Provide both **CLI** and **GUI** client options.
+* Demonstrate a **tiny, bespoke TCP protocol** (no HTTP).
+* Keep code small, auditable, portable (C11 + a tiny Python GUI).
+* Work **on a LAN** or **over the internet** (with firewall/NAT configured).
+* Provide both **CLI** and **GUI** clients, including **image preview**.
 
-## Quick protocol
+---
 
-Text-based, line-delimited:
+## Protocol (tiny, line-delimited)
+
+### Single-file server
 
 ```
-# Single-file server
 Client → "HEAD\n"              Server → "SIZE <n>\n\n"
 Client → "GET\n"               Server → "SIZE <n>\n\n" + <n raw bytes>
-
-# Multi-file server
-Client → "LIST\n"              Server → "FILES <count>\n<name>\t<size>\n...\n\n"
-Client → "HEAD <name>\n"       Server → "SIZE <n>\n\n"
-Client → "GET  <name>\n"       Server → "SIZE <n>\n\n" + <n raw bytes>
 ```
 
-Notes:
+### Multi-file server
 
-* `<name>` must be a plain filename (no `/`, `\`, or `..`) to avoid path traversal.
-* Server re-reads from disk per request, so edits are reflected on the next fetch.
+```
+Client → "LIST\n"
+Server → "FILES <count>\n<name>\t<size>\n...\n\n"
+# (Optionally the server can include MIME: "<name>\t<mime>\t<size>")
+
+Client → "HEAD <name>\n"
+Server → ["TYPE <mime>\n"] "SIZE <n>\n\n"
+
+Client → "GET  <name>\n"
+Server → ["TYPE <mime>\n"] "SIZE <n>\n\n" + <n raw bytes>
+```
+
+**Notes**
+
+* `<name>` is a plain filename only (no `/`, `\`, or `..`) to avoid path traversal.
+* Server re-reads from disk per request, so edits show up on next fetch.
+* **Images already work**: body is raw bytes; GUI auto-detects common image formats.
+  If the server sends `TYPE image/png` (optional), the client uses it; otherwise it guesses from filename/magic bytes.
+
+---
 
 ## Build
 
@@ -53,31 +77,40 @@ sudo apt update
 sudo apt install -y build-essential
 
 # single-file
-gcc -std=c11 -Wall -Wextra -O2 -o txtserve  txtserve.c
-gcc -std=c11 -Wall -Wextra -O2 -o txtclient txtclient.c
+gcc -std=c11 -Wall -Wextra -O2 -o txtserve         txtserve.c
+gcc -std=c11 -Wall -Wextra -O2 -o txtclient        txtclient.c
 
 # multi-file
-gcc -std=c11 -Wall -Wextra -O2 -o txtserve_multi  txtserve_multi.c
-gcc -std=c11 -Wall -Wextra -O2 -o txtclient_multi txtclient_multi.c
+gcc -std=c11 -Wall -Wextra -O2 -o txtserve_multi   txtserve_multi.c
+gcc -std=c11 -Wall -Wextra -O2 -o txtclient_multi  txtclient_multi.c
 ```
 
 ### macOS (clang)
 
 ```zsh
 # single-file
-clang -std=c11 -Wall -Wextra -O2 -o txtserve  txtserve.c
-clang -std=c11 -Wall -Wextra -O2 -o txtclient txtclient.c
+clang -std=c11 -Wall -Wextra -O2 -o txtserve         txtserve.c
+clang -std=c11 -Wall -Wextra -O2 -o txtclient        txtclient.c
 
 # multi-file
-clang -std=c11 -Wall -Wextra -O2 -o txtserve_multi  txtserve_multi.c
-clang -std=c11 -Wall -Wextra -O2 -o txtclient_multi txtclient_multi.c
+clang -std=c11 -Wall -Wextra -O2 -o txtserve_multi   txtserve_multi.c
+clang -std=c11 -Wall -Wextra -O2 -o txtclient_multi  txtclient_multi.c
 ```
 
-Optional GUI dependencies (macOS): Python 3 is preinstalled; Tkinter is included on most systems.
+### GUI (Python)
 
-## Run (typical setups)
+* Python 3 is included on macOS; Tkinter is usually available.
+* **For image preview**, install Pillow once:
 
-### A) Serve one file (LAN or public VM)
+```zsh
+python3 -m pip install --upgrade pillow
+```
+
+---
+
+## Run (typical)
+
+### A) Serve one file
 
 **Server (Ubuntu)**
 
@@ -103,47 +136,58 @@ printf "HEAD\n" | nc -v -w3 <SERVER_IP> 8088
 **Client (Mac)**
 
 ```zsh
-# list via netcat
+# list
 printf "LIST\n" | nc -v -w3 <SERVER_IP> 8088
 
-# fetch a specific file
+# fetch by name
 ./txtclient_multi <SERVER_IP> 8088 content.txt
+./txtclient_multi <SERVER_IP> 8088 logo.png > logo.png && open logo.png   # macOS
 ```
 
-### C) GUI client (macOS)
+### C) GUI client (text + image preview)
+
+**Client (Mac)**
 
 ```zsh
 python3 gui_client.py
-# Enter Host=<SERVER_IP>, Port=8088 → Connect/Refresh → click a file to view or save
+# Host=<SERVER_IP>, Port=8088 → Connect/Refresh → click a file to preview
+# Use “Save…” to download or “Open in Preview” for macOS Preview
 ```
+
+---
 
 ## Networking notes
 
-* **LAN access:** connect to the server’s **private** IP (e.g., `192.168.x.x`).
-* **Internet access (IPv4):** you must **port-forward** on the router
-  (WAN TCP `<port>` → `<LAN_IP>:<port>`), or run the server on a VM with a public IP.
-* **Internet access (IPv6):** server can bind IPv6; ensure inbound IPv6 is allowed on the router/ISP.
+* **LAN access:** connect to server’s **private** IP (e.g., `192.168.x.x`).
+* **Internet access (IPv4):** either port-forward (WAN TCP `<port>` → `<LAN_IP>:<port>`) **or** run on a public VM.
+* **Internet access (IPv6):** server can bind IPv6; make sure your router/ISP allows inbound IPv6.
 * **Firewalls:** open the chosen TCP port (e.g., `sudo ufw allow 8088/tcp` on Ubuntu).
-  On macOS, allow the app in **System Settings → Network → Firewall → Options**.
+  On macOS, allow binaries in **System Settings → Network → Firewall → Options**.
+
+---
 
 ## Security
 
-This protocol has **no authentication** and **no encryption** by default.
+By default there’s **no authentication** and **no encryption**.
 
-If confidentiality is required, use one of:
+If confidentiality is needed:
 
-* **WireGuard** between hosts (VPN; encrypts all traffic).
-* **TLS wrapper (stunnel/Caddy/Nginx stream)** in front of the server port.
-* Add a simple `AUTH <token>` step to the protocol (still recommend TLS for secrecy).
+* **WireGuard** between hosts (VPN; encrypts everything).
+* **TLS wrapper** (stunnel/Caddy/Nginx stream) in front of the server port.
+* Optional simple `AUTH <token>` header (still recommend TLS for secrecy).
 
-Avoid exposing it publicly without at least network ACLs or TLS.
+Avoid exposing a naked port on the public internet without at least ACLs or TLS.
+
+---
 
 ## Limitations
 
 * Single-threaded (one client at a time).
-* No range requests/resume; downloads are whole-file.
-* No MIME types or compression negotiation.
-* Not compatible with browsers/proxies (it’s not HTTP).
+* No resume/range; whole-file downloads only.
+* No compression negotiation or content-type registry (TYPE line is optional).
+* Not browser/proxy compatible (not HTTP).
+
+---
 
 ## Repo layout (example)
 
@@ -157,22 +201,25 @@ Avoid exposing it publicly without at least network ACLs or TLS.
 ├── gui_client.py
 └── myweb/
     ├── content.txt
-    └── other.txt
+    ├── other.txt
+    └── logo.png
 ```
+
+---
 
 ## Handy commands
 
 ```bash
-# Verify server is listening (Linux)
+# Verify server listens (Linux)
 ss -ltn 'sport = :8088'
 
-# Quick manual query
+# Manual queries
 printf "LIST\n" | nc -v -w3 <SERVER_IP> 8088
 printf "HEAD content.txt\n" | nc -v -w3 <SERVER_IP> 8088
-printf "GET content.txt\n"  | nc -v -w3 <SERVER_IP> 8088 > local_copy.txt
+printf "GET  content.txt\n" | nc -v -w3 <SERVER_IP> 8088 > local_copy.txt
+printf "GET  logo.png\n"    | nc -v -w3 <SERVER_IP> 8088 > logo.png
 ```
 
 ---
 
 **License/credits:** do whatever you want; this is for learning and small internal transfers.
-#hello
