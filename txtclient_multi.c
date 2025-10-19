@@ -1,73 +1,244 @@
-// txtclient_multi.c — request a named file
-// Usage:
-//   txtclient_multi <host> <port> <name>        # prints file
-//   txtclient_multi --head <host> <port> <name> # only SIZE
+// txtserve_multi.c — serve files by name from a directory root, plus LIST
+// Concurrency: fork-per-connection (each client handled in a child process)
+//
+// Protocol:
+//   LIST\n                  -> "FILES <n>\n<name>\t<size>\n...\n\n"
+//   GET  <name>\n          -> "SIZE <n>\n\n" + <n bytes>
+//   HEAD <name>\n          -> "SIZE <n>\n\n"
+// Notes:
+//   - <name> must be a simple filename (no '/' or "..").
+//   - This version forks on accept() so multiple clients are served in parallel.
 
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t g_stop = 0;
+static void on_sigint(int signum){ (void)signum; g_stop = 1; }
+
+// Reap dead children to avoid zombies
+static void on_sigchld(int signum){
+    (void)signum;
+    while (waitpid(-1, NULL, WNOHANG) > 0) { /* no-op */ }
+}
 
 static int send_all(int fd, const void *buf, size_t len){
     const char *p = (const char*)buf;
-    while(len){ ssize_t n=send(fd,p,len,0); if(n<0){ if(errno==EINTR) continue; return -1; } p+=n; len-= (size_t)n; }
+    while (len){
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0){
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += n; len -= (size_t)n;
+    }
     return 0;
 }
+
 static ssize_t recv_line(int fd, char *buf, size_t maxlen){
-    size_t i=0; while(i+1<maxlen){ char c; ssize_t n=recv(fd,&c,1,0);
-        if(n==0) break; if(n<0){ if(errno==EINTR) continue; return -1; }
-        buf[i++]=c; if(c=='\n') break; }
-    buf[i]='\0'; return (ssize_t)i;
+    size_t i = 0;
+    while (i + 1 < maxlen){
+        char c; ssize_t n = recv(fd, &c, 1, 0);
+        if (n == 0) break;
+        if (n < 0){
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        buf[i++] = c;
+        if (c == '\n') break;
+    }
+    buf[i] = '\0';
+    return (ssize_t)i;
+}
+
+static bool valid_name(const char *s){
+    if (*s == '\0') return false;
+    if (strstr(s, "..")) return false;
+    for (const char *p = s; *p; ++p){
+        if (*p == '/' || *p == '\\') return false;
+    }
+    return true;
+}
+
+static int do_list(int cfd, const char *rootdir){
+    DIR *d = opendir(rootdir);
+    if (!d){
+        char e[256]; int n = snprintf(e, sizeof(e), "ERR opendir (%s)\n", strerror(errno));
+        return send_all(cfd, e, (size_t)n);
+    }
+
+    struct dirent *de;
+    char lines[65536]; size_t off = 0; int count = 0;
+    while ((de = readdir(d))){
+        if (strcmp(de->d_name,".") == 0 || strcmp(de->d_name,"..") == 0) continue;
+        if (!valid_name(de->d_name)) continue;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", rootdir, de->d_name);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)){
+            char one[1024];
+            int n = snprintf(one, sizeof(one), "%s\t%lld\n", de->d_name, (long long)st.st_size);
+            if (n < 0) continue;
+            if (off + (size_t)n >= sizeof(lines)){ closedir(d); return send_all(cfd, "ERR too many files\n", 19); }
+            memcpy(lines + off, one, (size_t)n); off += (size_t)n;
+            count++;
+        }
+    }
+    closedir(d);
+
+    char head[64];
+    int hn = snprintf(head, sizeof(head), "FILES %d\n", count);
+    if (send_all(cfd, head, (size_t)hn) < 0) return -1;
+    if (count > 0 && send_all(cfd, lines, off) < 0) return -1;
+    if (send_all(cfd, "\n", 1) < 0) return -1;
+    return 0;
+}
+
+static int do_send_file(int cfd, const char *rootdir, const char *name, bool want_body){
+    if (!valid_name(name)) return send_all(cfd, "ERR bad name\n", 13);
+
+    char path[1024];
+    int pn = snprintf(path, sizeof(path), "%s/%s", rootdir, name);
+    if (pn < 0 || (size_t)pn >= sizeof(path)) return send_all(cfd, "ERR name too long\n", 19);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0){
+        char e[256]; int n = snprintf(e, sizeof(e), "ERR open (%s)\n", strerror(errno));
+        return send_all(cfd, e, (size_t)n);
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)){
+        close(fd);
+        return send_all(cfd, "ERR not file\n", 13);
+    }
+
+    long long size = (long long)st.st_size;
+    char hdr[64]; int hn = snprintf(hdr, sizeof(hdr), "SIZE %lld\n\n", size);
+    if (send_all(cfd, hdr, (size_t)hn) < 0){ close(fd); return -1; }
+
+    if (want_body && size > 0){
+        char buf[8192]; long long left = size;
+        while (left > 0){
+            ssize_t r = read(fd, buf, (left > (long long)sizeof(buf)) ? (ssize_t)sizeof(buf) : (ssize_t)left);
+            if (r < 0){ if (errno == EINTR) continue; break; }
+            if (r == 0) break;
+            if (send_all(cfd, buf, (size_t)r) < 0){ close(fd); return -1; }
+            left -= r;
+        }
+    }
+    close(fd);
+    return 0;
+}
+
+static int serve_once(int cfd, const char *rootdir){
+    char line[512];
+    ssize_t rn = recv_line(cfd, line, sizeof(line));
+    if (rn <= 0) return -1;
+
+    // Strip CRLF
+    for (ssize_t i = 0; i < rn; i++){
+        if (line[i] == '\r' || line[i] == '\n'){ line[i] = '\0'; break; }
+    }
+
+    if      (strcmp(line, "LIST") == 0)          return do_list(cfd, rootdir);
+    else if (strncmp(line, "GET ", 4)  == 0)     return do_send_file(cfd, rootdir, line + 4, true);
+    else if (strncmp(line, "HEAD ", 5) == 0)     return do_send_file(cfd, rootdir, line + 5, false);
+    else                                         return send_all(cfd, "ERR unknown command\n", 20);
 }
 
 int main(int argc, char **argv){
-    bool head=false; const char *host=NULL,*port=NULL,*name=NULL;
-    if(argc==4){ host=argv[1]; port=argv[2]; name=argv[3]; }
-    else if(argc==5 && strcmp(argv[1],"--head")==0){ head=true; host=argv[2]; port=argv[3]; name=argv[4]; }
-    else { fprintf(stderr,"Usage: %s <host> <port> <name>\n       %s --head <host> <port> <name>\n",argv[0],argv[0]); return 1; }
+    if (argc != 3){
+        fprintf(stderr, "Usage: %s <port> <root-directory>\n", argv[0]);
+        return 1;
+    }
+    const char *port = argv[1], *root = argv[2];
 
-    struct addrinfo hints,*res,*rp; memset(&hints,0,sizeof(hints));
-    hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
-    int rc=getaddrinfo(host,port,&hints,&res); if(rc){ fprintf(stderr,"getaddrinfo: %s\n",gai_strerror(rc)); return 1; }
+    // Signals
+    struct sigaction sa_int = {0}, sa_chld = {0};
+    sa_int.sa_handler = on_sigint;
+    sigemptyset(&sa_int.sa_mask);
+    sa_int.sa_flags = SA_RESTART;
+    sigaction(SIGINT,  &sa_int, NULL);
+    sigaction(SIGTERM, &sa_int, NULL);
 
-    int fd=-1; for(rp=res; rp; rp=rp->ai_next){
-        fd=socket(rp->ai_family,rp->ai_socktype,rp->ai_protocol);
-        if(fd<0) continue;
-        if(connect(fd,rp->ai_addr,(socklen_t)rp->ai_addrlen)==0) break;
-        close(fd); fd=-1;
+    sa_chld.sa_handler = on_sigchld;
+    sigemptyset(&sa_chld.sa_mask);
+    sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa_chld, NULL);
+
+    // Bind
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;   // change to AF_INET6 for IPv6
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE;
+
+    int rc = getaddrinfo(NULL, port, &hints, &res);
+    if (rc != 0){
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
+        return 1;
+    }
+
+    int sfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sfd < 0){ perror("socket"); freeaddrinfo(res); return 1; }
+
+    int yes = 1;
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    if (bind(sfd, res->ai_addr, (socklen_t)res->ai_addrlen) < 0){
+        perror("bind"); close(sfd); freeaddrinfo(res); return 1;
     }
     freeaddrinfo(res);
-    if(fd<0){ perror("connect"); return 1; }
 
-    char cmd[600];
-    int n=snprintf(cmd,sizeof(cmd),"%s %s\n", head?"HEAD":"GET", name);
-    if(n<0 || (size_t)n>=sizeof(cmd)){ fprintf(stderr,"name too long\n"); close(fd); return 1; }
+    if (listen(sfd, 64) < 0){ perror("listen"); close(sfd); return 1; }
 
-    if(send_all(fd,cmd,(size_t)n)<0){ perror("send"); close(fd); return 1; }
+    fprintf(stderr, "Serving files from %s on port %s (concurrent)\n", root, port);
 
-    char line[128];
-    if(recv_line(fd,line,sizeof(line))<=0){ fprintf(stderr,"protocol error (no SIZE)\n"); close(fd); return 1; }
-    long long sz=-1;
-    if(sscanf(line,"SIZE %lld",&sz)!=1 || sz<0){ fprintf(stderr,"bad SIZE header: %s",line); close(fd); return 1; }
+    while (!g_stop){
+        struct sockaddr_storage ss;
+        socklen_t slen = sizeof(ss);
+        int cfd = accept(sfd, (struct sockaddr*)&ss, &slen);
+        if (cfd < 0){
+            if (errno == EINTR && g_stop) break;
+            if (errno == EINTR) continue;
+            perror("accept");
+            continue;
+        }
 
-    if(recv_line(fd,line,sizeof(line))<=0 || strcmp(line,"\n")!=0){ fprintf(stderr,"protocol error (no blank line)\n"); close(fd); return 1; }
-
-    if(head){ printf("SIZE %lld bytes\n",sz); close(fd); return 0; }
-
-    long long left=sz; char buf[4096];
-    while(left>0){
-        ssize_t to=(left>(long long)sizeof(buf))?(ssize_t)sizeof(buf):(ssize_t)left;
-        ssize_t r=recv(fd,buf,to,0);
-        if(r<=0){ perror("recv"); close(fd); return 1; }
-        fwrite(buf,1,(size_t)r,stdout);
-        left-=r;
+        pid_t pid = fork();
+        if (pid == 0){
+            // child
+            close(sfd);
+            serve_once(cfd, root);
+            close(cfd);
+            _exit(0);
+        } else if (pid > 0){
+            // parent
+            close(cfd);
+            continue;
+        } else {
+            // fork failed — fallback to synchronous handling
+            serve_once(cfd, root);
+            close(cfd);
+        }
     }
-    close(fd);
+
+    close(sfd);
+    fprintf(stderr, "Stopped.\n");
     return 0;
 }
