@@ -1,3 +1,6 @@
+## Issues on Mac?
+
+<img width="372" height="362" alt="Screenshot 2025-10-20 at 14 54 44" src="https://github.com/user-attachments/assets/aba8551b-47c7-4abd-85ac-4444d174d76f" />
 
 The dialog is misleading. Gatekeeper uses the same “is damaged and can’t be opened” text for multiple cases (unsigned, altered-after-signing, or not notarized), which can imply network corruption when the file is intact.
 
